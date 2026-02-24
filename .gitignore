@@ -1,0 +1,4 @@
+data/processed/
+data/test/
+*.env
+venv/
