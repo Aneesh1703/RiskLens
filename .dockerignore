@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.env
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# Models (Raw/Training artifacts)
+# Only keep the onnx files and final joblib files, exclude heavy pt files if they exist
+models/*.pt
+models/*.pth
+
+# Jupyter Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Data directories (do not copy dynamic data into the container)
+data/processed/
+data/test/
+# Also ignore local sqlite db if present
+data/risk.db
+data/*.db
