@@ -9,17 +9,22 @@ import plotly.graph_objects as go
 from pathlib import Path
 import sys
 import os
-from dotenv import load_dotenv
-load_dotenv()
+
+try:
+    API_BASE = st.secrets["API_BASE_URL"]
+    API_KEY = st.secrets["API_SECRET_KEY"]
+except (FileNotFoundError, KeyError):
+    # Fallback for local development if secrets.toml isn't set up yet
+    API_BASE = "http://localhost:8000"
+    API_KEY = os.getenv("API_SECRET_KEY", "")
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "X-API-Key": API_KEY
+} if API_KEY else {}
 
 
-
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
-API_KEY  = os.getenv("API_SECRET_KEY", "")
-HEADERS  = {"X-API-Key": API_KEY} if API_KEY else {}
-
-
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
