@@ -12,7 +12,7 @@ import json
 import numpy as np
 import pandas as pd
 import joblib
-import torch
+import onnxruntime as ort
 from pathlib import Path
 from dataclasses import asdict
 from typing import Dict, Optional
@@ -32,7 +32,8 @@ from genai.copilot import create_session, ask
 PROJECT_ROOT    = SRC_DIR.parent
 IF_MODEL_PATH   = PROJECT_ROOT / "models" / "isolation_forest.joblib"
 IF_SCALER_PATH  = PROJECT_ROOT / "models" / "robust_scaler.joblib"
-LSTM_MODEL_PATH = PROJECT_ROOT / "models" / "lstm_risk_model.pt"
+ONNX_MODEL_PATH = PROJECT_ROOT / "models" / "lstm_risk_model.onnx"
+ONNX_META_PATH  = PROJECT_ROOT / "models" / "lstm_risk_model.meta.json"
 
 _model_cache = {}
 
@@ -40,6 +41,7 @@ _model_cache = {}
 def load_models(force_reload: bool = False):
     """Load all models into cache once."""
     if force_reload or not _model_cache:
+        # 1. Isolation Forest
         if IF_MODEL_PATH.exists():
             artifacts = joblib.load(IF_MODEL_PATH)
             _model_cache["if_model"]    = artifacts["model"]
@@ -48,23 +50,15 @@ def load_models(force_reload: bool = False):
         else:
             print("[WARN] Isolation Forest model not found")
 
-        if LSTM_MODEL_PATH.exists():
-            ckpt = torch.load(LSTM_MODEL_PATH, map_location="cpu", weights_only=False)
-            _model_cache["lstm_ckpt"] = ckpt
-
-            from train_sequence import LSTMRiskModel
-            lstm = LSTMRiskModel(
-                vocab_size  = len(ckpt["vocab"]),
-                embed_dim   = ckpt["embed_dim"],
-                hidden_dim  = ckpt["hidden_dim"],
-                num_meta    = ckpt["num_meta"],
-                num_classes = ckpt["num_classes"],
-            )
-            lstm.load_state_dict(ckpt["model_state"])
-            lstm.eval()
-            _model_cache["lstm_instance"] = lstm
+        # 2. ONNX LSTM Model
+        if ONNX_MODEL_PATH.exists() and ONNX_META_PATH.exists():
+            with open(ONNX_META_PATH, "r") as f:
+                _model_cache["onnx_meta"] = json.load(f)
+            
+            # Initialize ONNX InferenceSession globally
+            _model_cache["onnx_session"] = ort.InferenceSession(str(ONNX_MODEL_PATH))
         else:
-            print("[WARN] LSTM model not found")
+            print("[WARN] ONNX LSTM model or metadata not found")
     return _model_cache
 
 
@@ -85,31 +79,46 @@ def score_anomaly(session: dict) -> float:
     return round(max(0.0, min(1.0, 0.5 - raw)), 4)
 
 
+def _softmax(x):
+    """Compute softmax values for each set of scores in x."""
+    e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+    return e_x / e_x.sum(axis=1, keepdims=True)
+
+
 def score_sequence(session: dict) -> float:
-    """LSTM sequence risk score (0-1)."""
+    """ONNX sequence risk score (0-1)."""
     load_models()
-    ckpt = _model_cache.get("lstm_ckpt")
-    lstm = _model_cache.get("lstm_instance")
-    if ckpt is None or lstm is None:
+    meta_info = _model_cache.get("onnx_meta")
+    ort_sess  = _model_cache.get("onnx_session")
+    
+    if meta_info is None or ort_sess is None:
         return 0.0
 
-    vocab   = ckpt["vocab"]
-    max_len = ckpt["max_len"]
+    vocab   = meta_info["vocab"]
+    max_len = meta_info["max_len"]
+    
+    # Process sequence
     cmd_seq = session.get("command_sequence", "")
     cmds    = cmd_seq.split(" -> ")[-max_len:]
     ids     = [vocab.get(c, 1) for c in cmds]
     ids     = [0] * (max_len - len(ids)) + ids
-    x_seq   = torch.tensor([ids], dtype=torch.long)
+    x_seq   = np.array([ids], dtype=np.int64)
 
-    meta = _extract_meta(session, cmds, cmd_seq)
-    x_meta = torch.tensor(
-        (meta - ckpt["scaler_mean"]) / (ckpt["scaler_scale"] + 1e-8),
-        dtype=torch.float
-    )
+    # Process metadata
+    raw_meta = _extract_meta(session, cmds, cmd_seq)
+    scaler_mean = np.array(meta_info["scaler_mean"], dtype=np.float32)
+    scaler_scale = np.array(meta_info["scaler_scale"], dtype=np.float32)
+    
+    x_meta = (raw_meta - scaler_mean) / (scaler_scale + 1e-8)
+    x_meta = x_meta.astype(np.float32)
 
-    with torch.no_grad():
-        logits = lstm(x_seq, x_meta)
-        probs  = torch.softmax(logits, dim=1).numpy()[0]
+    # ONNX Inference
+    ort_inputs = {
+        "sequence": x_seq,
+        "metadata": x_meta
+    }
+    logits = ort_sess.run(["logits"], ort_inputs)[0]
+    probs = _softmax(logits)[0]
 
     return float(probs[2])
 
@@ -158,7 +167,7 @@ def score_session(session: dict, explain: bool = True) -> dict:
 
 
 def score_dataframe(df: pd.DataFrame, top_n_explain: int = 5) -> pd.DataFrame:
-    """Batch pipeline — vectorized IF + batched LSTM + optional Gemini for top-N."""
+    """Batch pipeline — vectorized IF + batched ONNX + optional Gemini for top-N."""
     load_models()
     df = df.copy()
 
@@ -179,13 +188,13 @@ def score_dataframe(df: pd.DataFrame, top_n_explain: int = 5) -> pd.DataFrame:
     else:
         df["anomaly_score"] = 0.0
 
-    # Batched LSTM
-    ckpt = _model_cache.get("lstm_ckpt")
-    lstm = _model_cache.get("lstm_instance")
+    # Batched ONNX Inference
+    meta_info = _model_cache.get("onnx_meta")
+    ort_sess  = _model_cache.get("onnx_session")
 
-    if ckpt is not None and lstm is not None:
-        vocab   = ckpt["vocab"]
-        max_len = ckpt["max_len"]
+    if meta_info is not None and ort_sess is not None:
+        vocab   = meta_info["vocab"]
+        max_len = meta_info["max_len"]
         all_seq_ids = []
         all_meta    = []
 
@@ -197,16 +206,22 @@ def score_dataframe(df: pd.DataFrame, top_n_explain: int = 5) -> pd.DataFrame:
             all_seq_ids.append(ids)
             all_meta.append(_extract_meta(row.to_dict(), cmds, cmd_seq)[0])
 
-        x_seq  = torch.tensor(all_seq_ids, dtype=torch.long)
-        meta   = np.array(all_meta, dtype=np.float32)
-        x_meta = torch.tensor(
-            (meta - ckpt["scaler_mean"]) / (ckpt["scaler_scale"] + 1e-8),
-            dtype=torch.float
-        )
+        x_seq  = np.array(all_seq_ids, dtype=np.int64)
+        raw_meta = np.array(all_meta, dtype=np.float32)
+        
+        scaler_mean = np.array(meta_info["scaler_mean"], dtype=np.float32)
+        scaler_scale = np.array(meta_info["scaler_scale"], dtype=np.float32)
+        
+        x_meta = (raw_meta - scaler_mean) / (scaler_scale + 1e-8)
+        x_meta = x_meta.astype(np.float32)
 
-        with torch.no_grad():
-            logits = lstm(x_seq, x_meta)
-            probs  = torch.softmax(logits, dim=1).numpy()
+        # Execute batched prediction natively via C++ ONNX
+        ort_inputs = {
+            "sequence": x_seq,
+            "metadata": x_meta
+        }
+        logits = ort_sess.run(["logits"], ort_inputs)[0]
+        probs  = _softmax(logits)
 
         df["sequence_score"] = probs[:, 2].round(4)
     else:

@@ -80,7 +80,6 @@ class CommandTokenizer:
         encoded = []
         for seq in sequences:
             cmds = seq.split(" -> ")
-            # Keep the TAIL so attack chain commands (usually appended) are preserved
             if len(cmds) > self.max_len:
                 cmds = cmds[-self.max_len:]
             ids        = [self.vocab.get(cmd, 1) for cmd in cmds]
@@ -107,7 +106,7 @@ def extract_meta_features(df: pd.DataFrame) -> np.ndarray:
     feats["after_hours"]   = df["after_hours"].astype(float)
     feats["command_count"] = df["command_count"].astype(float)
 
-    # Fraction of unique commands in the session (low = repetitive / scripted)
+    # Fraction of unique commands in the session
     def unique_ratio(seq):
         cmds = seq.split(" -> ")
         return len(set(cmds)) / max(len(cmds), 1)

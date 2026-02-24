@@ -51,7 +51,7 @@ def fuse_scores(anomaly_score: float,
     score = [anomaly_score, sequence_score, rule_score]
     final_risk = float(np.average(score, weights=[W_ANOMALY, W_SEQUENCE, W_RULES]))
 
-    # ── Escalation overrides (prevent dangerous averaging)
+
     if rule_score >= 0.9:
         final_risk = max(final_risk, 0.95)
     if anomaly_score > 0.85 and sequence_score > 0.85:
