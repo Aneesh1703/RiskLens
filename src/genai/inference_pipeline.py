@@ -232,13 +232,19 @@ def score_dataframe(df: pd.DataFrame, top_n_explain: int = 5) -> pd.DataFrame:
     df["rule_score"]      = rules_out.apply(lambda x: x[0])
     df["triggered_rules"] = rules_out.apply(lambda x: x[1])
 
-    # Fuse
-    df["final_risk"] = df.apply(
-        lambda r: fuse_scores(r["anomaly_score"], r["sequence_score"], r["rule_score"]).final_risk, axis=1
-    ).round(4)
-    df["risk_level"] = df["final_risk"].apply(
-        lambda x: "critical" if x >= 0.8 else "high" if x >= 0.55 else "medium" if x >= 0.3 else "low"
+    # Fuse (preserve rule context and confidence in batch output)
+    fused_out = df.apply(
+        lambda r: fuse_scores(
+            r["anomaly_score"],
+            r["sequence_score"],
+            r["rule_score"],
+            r["triggered_rules"],
+        ),
+        axis=1,
     )
+    df["final_risk"] = fused_out.apply(lambda x: x.final_risk).round(4)
+    df["risk_level"] = fused_out.apply(lambda x: x.risk_level)
+    df["confidence"] = fused_out.apply(lambda x: x.confidence).round(4)
 
     # Gemini explanations for top-N only
     df["explanation"] = ""
@@ -246,7 +252,12 @@ def score_dataframe(df: pd.DataFrame, top_n_explain: int = 5) -> pd.DataFrame:
         top_idx = df.nlargest(top_n_explain, "final_risk").index
         for idx in top_idx:
             row = df.loc[idx]
-            fused = fuse_scores(row["anomaly_score"], row["sequence_score"], row["rule_score"])
+            fused = fuse_scores(
+                row["anomaly_score"],
+                row["sequence_score"],
+                row["rule_score"],
+                row["triggered_rules"],
+            )
             df.at[idx, "explanation"] = str(asdict(explain_risk(fused, row.to_dict())))
 
     return df
